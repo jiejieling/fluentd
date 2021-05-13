@@ -20,7 +20,7 @@ module Fluent::Plugin
   class TailInput < Fluent::Plugin::Input
     class PositionFile
       UNWATCHED_POSITION = 0xffffffffffffffff
-      POSITION_FILE_ENTRY_REGEX = /^([^\t]+)\t([0-9a-fA-F]+)\t([0-9a-fA-F]+)/.freeze
+      POSITION_FILE_ENTRY_REGEX = /^([^\t]+)\t([0-9a-fA-F]+)\t([0-9a-fA-F]+)\t([0-9a-fA-F]+)/.freeze
 
       def self.load(file, follow_inodes, existing_paths, logger:)
         pf = new(file, follow_inodes, existing_paths, logger: logger)
@@ -45,11 +45,11 @@ module Fluent::Plugin
         @file_mutex.synchronize {
           @file.seek(0, IO::SEEK_END)
           seek = @file.pos + target_info.path.bytesize + 1
-          @file.write "#{target_info.path}\t0000000000000000\t0000000000000000\n"
+          @file.write "#{target_info.path}\t0000000000000000\t0000000000000000\t0000000000000000\n"
           if @follow_inodes
-            @map[target_info.ino] = FilePositionEntry.new(@file, @file_mutex, seek, 0, 0)
+            @map[target_info.ino] = FilePositionEntry.new(@file, @file_mutex, seek, 0, 0, 0)
           else
-            @map[target_info.path] = FilePositionEntry.new(@file, @file_mutex, seek, 0, 0)
+            @map[target_info.path] = FilePositionEntry.new(@file, @file_mutex, seek, 0, 0, 0)
           end
         }
       end
@@ -74,11 +74,12 @@ module Fluent::Plugin
             path = m[1]
             pos = m[2].to_i(16)
             ino = m[3].to_i(16)
+            ln = m[4] ? m[4].to_i(16) : 0
             seek = @file.pos - line.bytesize + path.bytesize + 1
             if @follow_inodes
-              map[ino] = FilePositionEntry.new(@file, @file_mutex, seek, pos, ino)
+              map[ino] = FilePositionEntry.new(@file, @file_mutex, seek, pos, ino, ln)
             else
-              map[path] = FilePositionEntry.new(@file, @file_mutex, seek, pos, ino)
+              map[path] = FilePositionEntry.new(@file, @file_mutex, seek, pos, ino, ln)
             end
           end
         end
@@ -143,6 +144,7 @@ module Fluent::Plugin
           path = m[1]
           pos = m[2].to_i(16)
           ino = m[3].to_i(16)
+          ln = m[4] ? m[4].to_i(16) : 0
           if pos == UNWATCHED_POSITION
             @logger.debug "Remove unwatched line from pos_file: #{line}" if @logger
           else
@@ -151,9 +153,9 @@ module Fluent::Plugin
             end
 
             if @follow_inodes
-              entries[ino] = Entry.new(path, pos, ino, file_pos + path.size + 1)
+              entries[ino] = Entry.new(path, pos, ino, ln, file_pos + path.size + 1)
             else
-              entries[path] = Entry.new(path, pos, ino, file_pos + path.size + 1)
+              entries[path] = Entry.new(path, pos, ino, ln, file_pos + path.size + 1)
             end
             file_pos += line.size
           end
@@ -171,11 +173,11 @@ module Fluent::Plugin
       end
     end
 
-    Entry = Struct.new(:path, :pos, :ino, :seek) do
-      POSITION_FILE_ENTRY_FORMAT = "%s\t%016x\t%016x\n".freeze
+    Entry = Struct.new(:path, :pos, :ino, :ln, :seek) do
+      POSITION_FILE_ENTRY_FORMAT = "%s\t%016x\t%016x\t%016x\n".freeze
 
       def to_entry_fmt
-        POSITION_FILE_ENTRY_FORMAT % [path, pos, ino]
+        POSITION_FILE_ENTRY_FORMAT % [path, pos, ino, ln]
       end
     end
 
@@ -185,26 +187,28 @@ module Fluent::Plugin
       POS_SIZE = 16
       INO_OFFSET = 17
       INO_SIZE = 16
-      LN_OFFSET = 33
-      SIZE = 34
+      LN_OFFSET = 34
+      SIZE = 50
 
-      def initialize(file, file_mutex, seek, pos, inode)
+      def initialize(file, file_mutex, seek, pos, inode, ln)
         @file = file
         @file_mutex = file_mutex
         @seek = seek
         @pos = pos
         @inode = inode
+        @ln = ln
       end
 
       attr_writer :seek
 
-      def update(ino, pos)
+      def update(ino, pos, ln)
         @file_mutex.synchronize {
           @file.pos = @seek
-          @file.write "%016x\t%016x" % [pos, ino]
+          @file.write "%016x\t%016x\t%016x" % [pos, ino, ln]
         }
         @pos = pos
         @inode = ino
+        @ln = ln
       end
 
       def update_pos(pos)
@@ -215,6 +219,14 @@ module Fluent::Plugin
         @pos = pos
       end
 
+      def update_ln(ln)
+        @file_mutex.synchronize {
+          @file.pos = @seek + LN_OFFSET
+          @file.write "%016x" % ln
+        }
+        @ln = ln
+      end
+
       def read_inode
         @inode
       end
@@ -222,25 +234,40 @@ module Fluent::Plugin
       def read_pos
         @pos
       end
+
+      def read_ln
+        @ln
+      end
+
     end
 
     class MemoryPositionEntry
       def initialize
         @pos = 0
         @inode = 0
+        @ln = 0
       end
 
-      def update(ino, pos)
+      def update(ino, pos, ln)
         @inode = ino
         @pos = pos
+        @ln = ln
       end
 
       def update_pos(pos)
         @pos = pos
       end
 
+      def update_ln(ln)
+        @ln = ln
+      end
+
       def read_pos
         @pos
+      end
+
+      def read_ln
+        @ln
       end
 
       def read_inode

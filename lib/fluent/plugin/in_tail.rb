@@ -109,6 +109,8 @@ module Fluent::Plugin
     config_param :path_timezone, :string, default: nil
     desc 'Follow inodes instead of following file names. Guarantees more stable delivery and allows to use * in path pattern with rotating files'
     config_param :follow_inodes, :bool, default: false
+    desc 'Add source line number to records. Specify the field name to be used.'
+    config_param :line_num_key, :string, default: nil
 
     config_section :parse, required: false, multi: true, init: true, param_name: :parser_configs do
       config_argument :usage, :string, default: 'in_tail_parser'
@@ -373,7 +375,7 @@ module Fluent::Plugin
 
     def setup_watcher(target_info, pe)
       line_buffer_timer_flusher = @multiline_mode ? TailWatcher::LineBufferTimerFlusher.new(log, @multiline_flush_interval, &method(:flush_buffer)) : nil
-      tw = TailWatcher.new(target_info, pe, log, @read_from_head, @follow_inodes, method(:update_watcher), line_buffer_timer_flusher, method(:io_handler))
+      tw = TailWatcher.new(target_info, pe, log, @read_from_head, @follow_inodes, @line_num_key, method(:update_watcher),  line_buffer_timer_flusher, method(:io_handler))
 
       if @enable_watch_timer
         tt = TimerTrigger.new(1, log) { tw.on_notify }
@@ -410,7 +412,7 @@ module Fluent::Plugin
         pe = @pf[target_info]
         if @read_from_head && pe.read_inode.zero?
           begin
-            pe.update(Fluent::FileWrapper.stat(target_info.path).ino, 0)
+            pe.update(Fluent::FileWrapper.stat(target_info.path).ino, 0, 0)
           rescue Errno::ENOENT
             $log.warn "#{target_info.path} not found. Continuing without tailing it."
           end
@@ -578,12 +580,20 @@ module Fluent::Plugin
         @parser.parse(line) { |time, record|
           if time && record
             record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+            tail_watcher.line_num += 1
+            if tail_watcher.line_num_key
+              record[tail_watcher.line_num_key] = tail_watcher.line_num unless record.has_key?(tail_watcher.line_num_key)
+            end
             es.add(time, record)
           else
             if @emit_unmatched_lines
               record = {'unmatched_line' => line}
               record[@path_key] ||= tail_watcher.path unless @path_key.nil?
-              es.add(Fluent::EventTime.now, record)
+              tail_watcher.line_num += 1
+              if tail_watcher.line_num_key
+                record[tail_watcher.line_num_key] = tail_watcher.line_num unless record.has_key?(tail_watcher.line_num_key)
+              end
+              es.add(::Fluent::Engine.now, record)
             end
             log.warn "pattern not matched: #{line.inspect}"
           end
@@ -688,26 +698,32 @@ module Fluent::Plugin
     end
 
     class TailWatcher
-      def initialize(target_info, pe, log, read_from_head, follow_inodes, update_watcher, line_buffer_timer_flusher, io_handler_build)
+      def initialize(target_info, pe, log, read_from_head, follow_inodes, line_num_key, update_watcher, line_buffer_timer_flusher, io_handler_build)
         @path = target_info.path
         @ino = target_info.ino
         @pe = pe || MemoryPositionEntry.new
         @read_from_head = read_from_head
         @follow_inodes = follow_inodes
+        @line_num_key = line_num_key
         @update_watcher = update_watcher
         @log = log
         @rotate_handler = RotateHandler.new(log, &method(:on_rotate))
         @line_buffer_timer_flusher = line_buffer_timer_flusher
+        @line_num = 0
         @io_handler = nil
         @io_handler_build = io_handler_build
         @watchers = []
       end
 
-      attr_reader :path, :ino
+      attr_reader :path, :ino, :line_num_key
       attr_reader :pe
       attr_reader :line_buffer_timer_flusher
-      attr_accessor :unwatched  # This is used for removing position entry from PositionFile
+      attr_accessor :unwatched, :line_num  # This is used for removing position entry from PositionFile
       attr_reader :watchers
+
+      def get_line_num
+        return @line_num
+      end
 
       def tag
         @parsed_tag ||= @path.tr('/', '.').gsub(/\.+/, '.').gsub(/^\./, '')
@@ -758,19 +774,23 @@ module Fluent::Plugin
               # in either case of a and b, seek to the saved position
               #   c) file was once renamed, truncated and then backed
               # in this case, consider it truncated
-              @pe.update(inode, 0) if fsize < @pe.read_pos
+              if fsize < @pe.read_pos
+                @pe.update(inode, 0, 0)
+              else
+                @line_num = @pe.read_ln
+              end
             elsif last_inode != 0
               # this is FilePositionEntry and fluentd once started.
               # read data from the head of the rotated file.
               # logs never duplicate because this file is a rotated new file.
-              @pe.update(inode, 0)
+              @pe.update(inode, 0, 0)
             else
               # this is MemoryPositionEntry or this is the first time fluentd started.
               # seek to the end of the any files.
               # logs may duplicate without this seek because it's not sure the file is
               # existent file or rotated new file.
               pos = @read_from_head ? 0 : fsize
-              @pe.update(inode, pos)
+              @pe.update(inode, pos, 0)
             end
             @io_handler = io_handler
           else
@@ -783,9 +803,10 @@ module Fluent::Plugin
             inode = stat.ino
             if inode == @pe.read_inode # truncated
               @pe.update_pos(0)
+              @pe.update_ln(0)
               @io_handler.close
             elsif !@io_handler.opened? # There is no previous file. Reuse TailWatcher
-              @pe.update(inode, 0)
+              @pe.update(inode, 0, 0)
             else # file is rotated and new file found
               watcher_needs_update = true
               # Handle the old log file before renewing TailWatcher [fluentd#1055]
@@ -829,7 +850,7 @@ module Fluent::Plugin
       def swap_state(pe)
         # Use MemoryPositionEntry for rotated file temporary
         mpe = MemoryPositionEntry.new
-        mpe.update(pe.read_inode, pe.read_pos)
+        mpe.update(pe.read_inode, pe.read_pos, pe.read_ln)
         @pe = mpe
         pe # This pe will be updated in on_rotate after TailWatcher is initialized
       end
@@ -982,6 +1003,7 @@ module Fluent::Plugin
               unless @lines.empty?
                 if @receive_lines.call(@lines, @watcher)
                   @watcher.pe.update_pos(io.pos - @fifo.bytesize)
+                  @watcher.pe.update_ln(@watcher.get_line_num())
                   @lines.clear
                 else
                   read_more = false
