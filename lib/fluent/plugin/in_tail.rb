@@ -962,7 +962,7 @@ module Fluent::Plugin
           @log.debug("time_spent_reading: #{time_spent_reading} #{ @watcher.path}")
           if time_spent_reading < 1
             needed_sleeping_time = 1 - time_spent_reading
-            @log.debug("log ingestion for `#{@path}' is suspended temporary. Read it again later.")
+            @log.debug("log ingestion for `#{@path}' is suspended tempoirary. Read it again later.")
             return true
           end
 

@@ -111,9 +111,9 @@ module Fluent::Plugin
           # add track information
           if @track_key
             if new_record.has_key?(@track_key)
-              new_record[@track_key] = "#{new_record[@track_key]},#{@hostname},#{Time.new.to_i}"
+              new_record[@track_key] = "#{new_record[@track_key]},#{@hostname},#{Time.new.to_f}"
             else
-              new_record[@track_key] = "#{@hostname},#{Time.new.to_i}"
+              new_record[@track_key] = "#{@hostname},#{Time.new.to_f}"
             end
           end
 
